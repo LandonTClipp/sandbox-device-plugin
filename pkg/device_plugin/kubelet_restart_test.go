@@ -271,8 +271,6 @@ var _ = Describe("Device health polling", func() {
 		Expect(os.Remove(filepath.Join(devDir, "1"))).To(Succeed())
 		Eventually(dp.unhealthy, "5s").Should(Receive(Equal("1")))
 
-		// The old per-device inotify watch could never deliver this direction:
-		// the watch died with the inode, so a device could never recover.
 		Expect(os.WriteFile(filepath.Join(devDir, "1"), nil, 0o600)).To(Succeed())
 		Eventually(dp.healthy, "5s").Should(Receive(Equal("1")))
 	})

@@ -126,11 +126,11 @@ func (dpi *GenericDevicePlugin) Start(stop chan struct{}) error {
 		dpi.stop = stop
 	}
 
-	return dpi.startLocked()
+	return dpi.startUnprotected()
 }
 
-// startLocked brings up a new gRPC server generation. dpi.mu must be held.
-func (dpi *GenericDevicePlugin) startLocked() error {
+// startUnprotected brings up a new gRPC server generation. dpi.mu must be held.
+func (dpi *GenericDevicePlugin) startUnprotected() error {
 	if dpi.server != nil {
 		return fmt.Errorf("gRPC server already started")
 	}
@@ -179,11 +179,11 @@ func (dpi *GenericDevicePlugin) Stop() error {
 	dpi.mu.Lock()
 	defer dpi.mu.Unlock()
 
-	return dpi.stopLocked()
+	return dpi.stopUnprotected()
 }
 
-// stopLocked tears down the current gRPC server generation. dpi.mu must be held.
-func (dpi *GenericDevicePlugin) stopLocked() error {
+// stopUnprotected tears down the current gRPC server generation. dpi.mu must be held.
+func (dpi *GenericDevicePlugin) stopUnprotected() error {
 	dpi.registeredWithKubelet = false
 
 	// Signal ListAndWatch and healthCheck for this generation to return.
@@ -212,12 +212,12 @@ func (dpi *GenericDevicePlugin) restart() error {
 	dpi.mu.Lock()
 	defer dpi.mu.Unlock()
 
-	if err := dpi.stopLocked(); err != nil {
+	if err := dpi.stopUnprotected(); err != nil {
 		// Losing the old socket file is expected here: kubelet just deleted it.
 		log.Printf("[%s] Error stopping device plugin server: %v", dpi.deviceName, err)
 	}
 
-	return dpi.startLocked()
+	return dpi.startUnprotected()
 }
 
 // registered reports whether kubelet can currently reach this plugin: it
