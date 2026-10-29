@@ -233,7 +233,7 @@ var _ = Describe("Re-registration when kubelet restarts", func() {
 	})
 })
 
-var _ = Describe("Device health polling", func() {
+var _ = Describe("Device health checks", func() {
 	var (
 		devDir             string
 		dp                 *GenericDevicePlugin
@@ -273,6 +273,38 @@ var _ = Describe("Device health polling", func() {
 
 		Expect(os.WriteFile(filepath.Join(devDir, "1"), nil, 0o600)).To(Succeed())
 		Eventually(dp.healthy, "5s").Should(Receive(Equal("1")))
+	})
+
+	It("detects changes from the directory watch without waiting for the poll", func() {
+		go dp.runHealthCheck(make(chan struct{}), time.Hour)
+
+		// Give the watch time to be set up before the first change.
+		time.Sleep(200 * time.Millisecond)
+
+		Expect(os.Remove(filepath.Join(devDir, "1"))).To(Succeed())
+		Eventually(dp.unhealthy, "2s").Should(Receive(Equal("1")))
+
+		Expect(os.WriteFile(filepath.Join(devDir, "1"), nil, 0o600)).To(Succeed())
+		Eventually(dp.healthy, "2s").Should(Receive(Equal("1")))
+	})
+
+	It("re-establishes the watch after the device directory is recreated", func() {
+		go dp.runHealthCheck(make(chan struct{}), 3*time.Second)
+		time.Sleep(200 * time.Millisecond)
+
+		Expect(os.RemoveAll(devDir)).To(Succeed())
+		Eventually(dp.unhealthy, "2s").Should(Receive(Equal("1")))
+
+		// With the directory gone there is nothing to watch, so the poll has
+		// to notice the device returning. That pass also re-arms the watch
+		// before it reports the device healthy.
+		Expect(os.Mkdir(devDir, 0o755)).To(Succeed())
+		Expect(os.WriteFile(filepath.Join(devDir, "1"), nil, 0o600)).To(Succeed())
+		Eventually(dp.healthy, "5s").Should(Receive(Equal("1")))
+
+		// Well inside the next poll, so only the re-armed watch can see this.
+		Expect(os.Remove(filepath.Join(devDir, "1"))).To(Succeed())
+		Eventually(dp.unhealthy, "1s").Should(Receive(Equal("1")))
 	})
 
 	It("stops when the gRPC server generation is torn down", func() {

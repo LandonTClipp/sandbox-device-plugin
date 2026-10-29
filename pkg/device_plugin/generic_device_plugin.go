@@ -41,6 +41,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/fsnotify/fsnotify"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
 	pluginapi "k8s.io/kubelet/pkg/apis/deviceplugin/v1beta1"
@@ -394,16 +395,19 @@ func (dpi *GenericDevicePlugin) GetPreferredAllocation(ctx context.Context, in *
 // healthCheck monitors the device nodes backing this plugin's devices and
 // reports health transitions to ListAndWatch.
 //
-// This polls rather than using inotify, on purpose. The device nodes under
-// /dev/vfio/devices are character devices (crw------- root:root), and
-// inotify_add_watch() needs read permission on the inode, which routes through
-// the device cgroup check. This DaemonSet mounts /dev/vfio as a hostPath but is
-// not granted those devices by the container runtime, so the kernel answers
-// EPERM -- which is exactly the "operation not permitted" seen fleet-wide.
-// os.Stat() only needs search permission on the parent directories and is not
-// subject to that check, so it works in the same security context.
+// Device nodes are checked with os.Stat(), and the check runs whenever the
+// device directory (/dev/vfio or /dev/vfio/devices) changes, plus every
+// interval as a backstop for missed events or a watch that could not be set up.
 //
-// Watching individual device nodes was also unable to ever report a device
+// The watch is on the directory, never on the device nodes themselves. The
+// nodes are character devices (crw------- root:root), and inotify_add_watch()
+// needs read permission on the inode, which routes through the device cgroup
+// check. This DaemonSet mounts /dev/vfio as a hostPath but is not granted those
+// devices by the container runtime, so the kernel answers EPERM. The directory
+// is an ordinary directory, and os.Stat() only needs search permission on the
+// parent directories, so neither is subject to that check.
+//
+// A watch on a device node would also be unable to ever report a device
 // healthy again: an inotify watch on a non-directory dies with the inode, so
 // no Create event can be delivered for the path once it is gone.
 //
@@ -435,13 +439,39 @@ func (dpi *GenericDevicePlugin) runHealthCheck(done chan struct{}, interval time
 		lastHealthy[dev.ID] = dev.Health == pluginapi.Healthy
 	}
 
-	log.Printf("%s: polling %d device node(s) under %s every %s",
+	log.Printf("%s: checking %d device node(s) under %s on change and every %s",
 		method, len(devicePaths), dpi.devicePath, interval)
+
+	watchDir := filepath.Clean(dpi.devicePath)
+	var watcher *fsnotify.Watcher
+	watchFailing := false
+	defer func() {
+		if watcher != nil {
+			watcher.Close()
+		}
+	}()
 
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
 
 	for {
+		// (Re-)establish the directory watch before checking, so that a change
+		// between the check and the watch being set up is not missed.
+		if watcher == nil {
+			watcher, err = newDirWatcher(watchDir)
+			if err != nil {
+				// Retried every interval; only log the first failure.
+				if !watchFailing {
+					log.Printf("%s: unable to watch %s, relying on the %s poll: %v", method, watchDir, interval, err)
+				}
+				watcher = nil
+				watchFailing = true
+			} else if watchFailing {
+				log.Printf("%s: watching %s again", method, watchDir)
+				watchFailing = false
+			}
+		}
+
 		for id, devPath := range devicePaths {
 			healthy := deviceNodePresent(method, devPath)
 			if healthy == lastHealthy[id] {
@@ -469,8 +499,33 @@ func (dpi *GenericDevicePlugin) runHealthCheck(done chan struct{}, interval time
 			}
 		}
 
+		var events chan fsnotify.Event
+		var watchErrors chan error
+		if watcher != nil {
+			events, watchErrors = watcher.Events, watcher.Errors
+		}
+
 		select {
 		case <-ticker.C:
+		case event, ok := <-events:
+			// Any change in the directory triggers a full check; the event
+			// itself does not need to name one of our devices. If the
+			// directory itself went away, the watch is gone with it, so drop
+			// it and let the next pass set it up again.
+			if !ok || (event.Name == watchDir && event.Has(fsnotify.Remove|fsnotify.Rename)) {
+				log.Printf("%s: lost watch on %s, re-establishing", method, watchDir)
+				watcher.Close()
+				watcher = nil
+			}
+		case err, ok := <-watchErrors:
+			// Typically an event queue overflow. The check that follows
+			// recovers whatever was dropped.
+			if !ok {
+				watcher.Close()
+				watcher = nil
+			} else {
+				log.Printf("%s: error watching %s: %v", method, watchDir, err)
+			}
 		case <-dpi.stop:
 			log.Printf("%s: shutting down", method)
 			return nil
